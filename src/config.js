@@ -2,7 +2,7 @@
 // Uses environment variables or a config.json file
 
 import { readFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -17,9 +17,7 @@ function loadConfig() {
       // Environment variables take precedence
       return {
         baleToken: process.env.BALE_BOT_TOKEN || fileConfig.baleToken,
-        allowedUsers: process.env.ALLOWED_USERS
-          ? process.env.ALLOWED_USERS.split(',').map(Number)
-          : fileConfig.allowedUsers || [],  // empty = allow all
+        usersFile: resolve(PROJECT_ROOT, process.env.USERS_FILE || fileConfig.usersFile || 'users.json'),
         freebuffPath: process.env.FREEBUFF_PATH || fileConfig.freebuffPath || 'freebuff',
         sessionTimeoutMs: process.env.SESSION_TIMEOUT_MS
           ? Number(process.env.SESSION_TIMEOUT_MS)
@@ -44,9 +42,7 @@ function loadConfig() {
 
   return {
     baleToken: process.env.BALE_BOT_TOKEN,
-    allowedUsers: process.env.ALLOWED_USERS
-      ? process.env.ALLOWED_USERS.split(',').map(Number)
-      : [],
+    usersFile: resolve(PROJECT_ROOT, process.env.USERS_FILE || 'users.json'),
     freebuffPath: process.env.FREEBUFF_PATH || 'freebuff',
     sessionTimeoutMs: process.env.SESSION_TIMEOUT_MS
       ? Number(process.env.SESSION_TIMEOUT_MS)

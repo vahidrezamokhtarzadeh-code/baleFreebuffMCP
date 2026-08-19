@@ -10,11 +10,7 @@ async function main() {
   console.log(`   Working dir: ${config.freebuffWorkingDir}`);
   console.log(`   Freebuff path: ${config.freebuffPath}`);
   console.log(`   Session timeout: ${config.sessionTimeoutMs / 60000} min`);
-  if (config.allowedUsers.length > 0) {
-    console.log(`   Allowed users: ${config.allowedUsers.join(', ')}`);
-  } else {
-    console.log(`   Access: All users allowed`);
-  }
+  console.log(`   Users file: ${config.usersFile}`);
 
   // Initialize Bale bot
   const bot = new BaleBot(config.baleToken, {
@@ -41,6 +37,12 @@ async function main() {
       await bridge.handleMessage(message);
     } catch (err) {
       console.error('❌ Unhandled error in message handler:', err);
+    }
+  }, async (query) => {
+    try {
+      await bridge.handleCallbackQuery(query);
+    } catch (err) {
+      console.error('❌ Unhandled error in callback handler:', err);
     }
   });
 

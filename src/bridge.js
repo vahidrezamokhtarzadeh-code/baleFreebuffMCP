@@ -4,17 +4,18 @@
 
 import { FreebuffSession } from './freebuff.js';
 import config from './config.js';
+import { UserStore } from './user-store.js';
 
 export class Bridge {
   constructor(baleBot) {
     this.baleBot = baleBot;
+    this.userStore = new UserStore(config.usersFile);
     this.sessions = new Map();
     this.processing = new Map();
   }
 
-  isAuthorized(userId) {
-    if (config.allowedUsers.length === 0) return true;
-    return config.allowedUsers.includes(userId);
+  isAuthenticated(userId) {
+    return this.userStore.isAuthenticated(userId);
   }
 
   async handleMessage(message) {
@@ -24,38 +25,31 @@ export class Bridge {
 
     console.log(`📩 [BRIDGE] Message from user=${userId} chat=${chatId}: "${text.substring(0, 100)}"`);
 
-    if (!this.isAuthorized(userId)) {
-      await this.baleBot.sendMessage(chatId, '⛔ دسترسی غیرمجاز.');
-      return;
-    }
-
     if (text.startsWith('/')) {
-      await this.handleCommand(chatId, text);
+      await this.handleCommand(chatId, userId, text, message.from);
       return;
     }
 
     if (text.trim()) {
-      await this.sendToFreebuff(chatId, text);
+      if (!this.isAuthenticated(userId)) {
+        await this.baleBot.sendMessage(chatId, '⛔ ابتدا احراز هویت کنید.\nاز /start <توکن شما> استفاده کنید.');
+        return;
+      }
+      await this.sendToFreebuff(chatId, userId, text);
     }
   }
 
-  async handleCommand(chatId, text) {
-    const command = text.split(' ')[0].toLowerCase();
+  async handleCommand(chatId, userId, text, from = {}) {
+    const parts = text.trim().split(/\s+/);
+    const command = parts[0].toLowerCase();
 
     switch (command) {
       case '/start':
-        await this.baleBot.sendMessage(chatId,
-          '🤖 به Freebuff Bot خوش آمدید!\n\n' +
-          '💬 هر پیام متنی بفرستید تا در Freebuff اجرا شود.\n\n' +
-          '📌 دستورات:\n' +
-          '/new - شروع session جدید\n' +
-          '/stop - متوقف کردن session\n' +
-          '/status - وضعیت session\n' +
-          '/help - راهنما'
-        );
+        await this.handleStart(chatId, userId, parts[1], from);
         break;
 
       case '/help':
+        if (!this.isAuthenticated(userId)) return this.sendAuthReminder(chatId);
         await this.baleBot.sendMessage(chatId,
           '📖 راهنمای Freebuff Bot\n\n' +
           '💬 پیام متنی → اجرا در Freebuff\n' +
@@ -66,17 +60,20 @@ export class Bridge {
         break;
 
       case '/new':
-        await this.stopSession(chatId);
+        if (!this.isAuthenticated(userId)) return this.sendAuthReminder(chatId);
+        await this.stopSession(userId);
         await this.baleBot.sendMessage(chatId, '🔄 Session جدید ایجاد شد.');
         break;
 
       case '/stop':
-        await this.stopSession(chatId);
+        if (!this.isAuthenticated(userId)) return this.sendAuthReminder(chatId);
+        await this.stopSession(userId);
         await this.baleBot.sendMessage(chatId, '⏹️ Session متوقف شد.');
         break;
 
       case '/status': {
-        const session = this.sessions.get(chatId);
+        if (!this.isAuthenticated(userId)) return this.sendAuthReminder(chatId);
+        const session = this.sessions.get(String(userId));
         if (session && session.isAlive()) {
           const uptime = Math.round((Date.now() - session.sessionStartTime) / 60000);
           await this.baleBot.sendMessage(chatId,
@@ -89,31 +86,77 @@ export class Bridge {
       }
 
       default:
+        if (!this.isAuthenticated(userId)) return this.sendAuthReminder(chatId);
         await this.baleBot.sendMessage(chatId, `❓ دستور ناشناخته: ${command}`);
+    }
+  }
+
+  async handleStart(chatId, userId, token, from = {}) {
+    const userToken = this.userStore.registerUser(userId, from.username, from.first_name);
+    if (!token) {
+      if (this.isAuthenticated(userId)) return this.sendMainMenu(chatId, '🤖 به Freebuff Bot خوش آمدید!');
+      await this.baleBot.sendMessage(chatId, `🔑 توکن شما: ${userToken}\n\nبرای فعال‌سازی، /start ${userToken} را ارسال کنید.`);
+      return;
+    }
+
+    const result = this.userStore.authenticateByToken(token, userId);
+    if (!result.success) {
+      const text = result.reason === 'belongs_to_another_user'
+        ? '❌ این توکن متعلق به کاربر دیگری است.'
+        : '❌ توکن معتبر نیست.';
+      await this.baleBot.sendMessage(chatId, text);
+      return;
+    }
+    await this.sendMainMenu(chatId, '✅ احراز هویت با موفقیت انجام شد!\n\n🤖 به Freebuff Bot خوش آمدید!');
+  }
+
+  async sendMainMenu(chatId, text) {
+    await this.baleBot.sendInlineKeyboard(chatId, text, [[
+      { text: '📊 وضعیت Session', callback_data: 'status' },
+      { text: '📖 راهنما', callback_data: 'help' },
+    ]]);
+  }
+
+  async sendAuthReminder(chatId) {
+    await this.baleBot.sendMessage(chatId, '⛔ ابتدا احراز هویت کنید.\nاز /start <توکن شما> استفاده کنید.');
+  }
+
+  async handleCallbackQuery(query) {
+    const chatId = query.message?.chat?.id;
+    const userId = query.from?.id;
+    const data = query.data;
+    await this.baleBot.call('answerCallbackQuery', { callback_query_id: query.id });
+    if (!chatId || !userId) return;
+    if (!this.isAuthenticated(userId)) return this.sendAuthReminder(chatId);
+    if (data === 'help') {
+      await this.baleBot.sendMessage(chatId, '📖 راهنمای Freebuff Bot\n\n💬 پیام متنی → اجرا در Freebuff\n/new → session جدید\n/stop → توقف session\n/status → وضعیت فعلی');
+    } else if (data === 'status') {
+      await this.handleCommand(chatId, userId, '/status');
     }
   }
 
   // ─── Core: Send to Freebuff ───────────────────────────────────
 
-  async sendToFreebuff(chatId, text) {
-    console.log(`🚀 [BRIDGE] sendToFreebuff chat=${chatId} text="${text.substring(0, 80)}"`);
+  async sendToFreebuff(chatId, userId, text) {
+    const sessionKey = String(userId);
+    console.log(`🚀 [BRIDGE] sendToFreebuff user=${sessionKey} chat=${chatId} text="${text.substring(0, 80)}"`);
 
     // Prevent concurrent sends
-    if (this.processing.get(chatId)) {
+    if (this.processing.get(sessionKey)) {
       await this.baleBot.sendMessage(chatId, '⏳ لطفاً صبر کنید... پاسخ قبلی هنوز آماده نشده.');
       return;
     }
 
-    this.processing.set(chatId, true);
+    this.processing.set(sessionKey, true);
 
     try {
       // Get or create session — wait for ready
-      let session = this.sessions.get(chatId);
+      let session = this.sessions.get(sessionKey);
       if (!session || !session.isAlive() || !session.isIdle()) {
         console.log(`🔄 [BRIDGE] Need new/ready session for chat ${chatId}`);
         await this.baleBot.sendMessage(chatId, '🔄 در حال راه‌اندازی Freebuff...');
 
-        session = await this.createSession(chatId);
+        session = await this.createSession(sessionKey);
         if (!session) {
           await this.baleBot.sendMessage(chatId, '❌ خطا در راه‌اندازی Freebuff.');
           return;
@@ -161,12 +204,12 @@ export class Bridge {
       console.error(`❌ [BRIDGE] Error:`, err.message);
       await this.baleBot.sendMessage(chatId, `❌ خطا: ${err.message}`);
     } finally {
-      this.processing.set(chatId, false);
+      this.processing.set(sessionKey, false);
     }
   }
 
-  async createSession(chatId) {
-    const existing = this.sessions.get(chatId);
+  async createSession(userId) {
+    const existing = this.sessions.get(userId);
     if (existing) existing.destroy();
 
     const session = new FreebuffSession({
@@ -177,8 +220,8 @@ export class Bridge {
     });
 
     session.on('exit', () => {
-      console.log(`🔴 [BRIDGE] Session for chat ${chatId} exited`);
-      this.sessions.delete(chatId);
+      console.log(`🔴 [BRIDGE] Session for user ${userId} exited`);
+      this.sessions.delete(userId);
     });
 
     // Spawn and wait for ready
@@ -199,16 +242,16 @@ export class Bridge {
     });
 
     if (ready) {
-      this.sessions.set(chatId, session);
+      this.sessions.set(userId, session);
     }
     return session;
   }
 
-  async stopSession(chatId) {
-    const session = this.sessions.get(chatId);
+  async stopSession(userId) {
+    const session = this.sessions.get(String(userId));
     if (session) {
       session.destroy();
-      this.sessions.delete(chatId);
+      this.sessions.delete(String(userId));
     }
   }
 

@@ -33,17 +33,25 @@ export class BaleBot {
   }
 
   // Send a text message
-  async sendMessage(chatId, text, { replyToMessageId = null, parseMode = null } = {}) {
+  async sendMessage(chatId, text, { replyToMessageId = null, parseMode = null, reply_markup = null } = {}) {
     console.log(`📤 [BALE] Sending to chat ${chatId}: "${text.substring(0, 80)}..."`);
     const params = {
       chat_id: String(chatId),
       text,
       ...(parseMode && { parse_mode: parseMode }),
       ...(replyToMessageId && { reply_to_message_id: replyToMessageId }),
+      ...(reply_markup && { reply_markup }),
     };
     const result = await this.call('sendMessage', params);
     console.log(`✅ [BALE] Message sent (id=${result.message_id})`);
     return result;
+  }
+
+  async sendInlineKeyboard(chatId, text, keyboard, opts = {}) {
+    return this.sendMessage(chatId, text, {
+      ...opts,
+      reply_markup: { inline_keyboard: keyboard },
+    });
   }
 
   // Send a chat action (typing indicator)
@@ -75,7 +83,7 @@ export class BaleBot {
   }
 
   // Start polling loop
-  async start(onMessage) {
+  async start(onMessage, onCallbackQuery = null) {
     this.running = true;
     console.log('🤖 Bale bot is listening...');
     console.log(`🔗 [BALE] Base URL: ${this.baseURL.substring(0, 40)}...`);
@@ -91,6 +99,9 @@ export class BaleBot {
             const msg = update.message;
             console.log(`📩 [BALE] Message: user=${msg.from?.id} chat=${msg.chat?.id} text="${(msg.text || '').substring(0, 50)}"`);
             await onMessage(msg);
+          }
+          if (update.callback_query && onCallbackQuery) {
+            await onCallbackQuery(update.callback_query);
           }
         }
       } catch (err) {
