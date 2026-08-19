@@ -1,0 +1,17 @@
+{
+  "name": "bale-freebuff-bot",
+  "version": "1.0.0",
+  "description": "Bridge between Bale messenger bot and Freebuff CLI",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

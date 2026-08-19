@@ -1,0 +1,10 @@
+{
+  "baleToken": "YOUR_BALE_BOT_TOKEN_HERE",
+  "allowedUsers": [],
+  "freebuffPath": "freebuff",
+  "sessionTimeoutMs": 1800000,
+  "maxOutputLength": 3500,
+  "pollTimeout": 30,
+  "freebuffWorkingDir": "/home/user/my-project",
+  "responseWaitMs": 60000
+}
