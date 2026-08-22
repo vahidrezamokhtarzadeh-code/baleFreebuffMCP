@@ -9,7 +9,8 @@
 5. [Data Flow](#data-flow)
 6. [Setup & Usage](#setup--usage)
 7. [Bot Commands](#bot-commands)
-8. [Limitations & Troubleshooting](#limitations--troubleshooting)
+8. [Token Authentication](#token-authentication)
+9. [Limitations & Troubleshooting](#limitations--troubleshooting)
 
 ---
 
@@ -21,10 +22,12 @@ Users interact with Freebuff entirely through Bale chat messages — the bot spa
 
 ### Key Design Decisions
 
-- **Per-user PTY sessions** — each user gets an isolated `node-pty` process running Freebuff.
+- **Token-based authentication** — each Bale user gets a unique token and must authenticate before using the bot.
+- **Per-user PTY sessions** — each authenticated user gets an isolated `node-pty` process running Freebuff.
 - **VT100 screen buffer emulation** — because Freebuff is a TUI app, the bot must parse terminal escape sequences to extract visible text content.
 - **Region-based extraction** — only the conversation area (rows 9–31) of Freebuff's screen is captured, ignoring the logo, status bar, and input area.
 - **Noise filtering** — box-drawing characters, status bar text, thinking indicators, and other TUI chrome are stripped via regex patterns.
+- **Inline keyboard menus** — provides button-based navigation for session status and help.
 
 ---
 
@@ -37,15 +40,26 @@ Users interact with Freebuff entirely through Bale chat messages — the bot spa
 └────────────────────┘         └──────────────┘         └──────────────────┘
        bale.js                        │                         │
                                config.js                   vt-screen.js
+                               user-store.js
 ```
+
+### Session Keying
+
+```
+BEFORE:  chatId → session    (1 chat = 1 session)
+AFTER:   userId → session    (1 user = 1 session, regardless of chat)
+```
+
+Each authenticated user gets exactly one Freebuff PTY process. If the user chats from different conversations (group + DM), they share the same session.
 
 ### Component Summary
 
 | File | Purpose |
 |------|---------|
 | `src/index.js` | Entry point — initializes bot, bridge, handles graceful shutdown |
-| `src/bale.js` | Bale Bot API client (long-polling, send/delete messages) |
-| `src/bridge.js` | Message routing — maps Bale chat IDs to Freebuff sessions |
+| `src/bale.js` | Bale Bot API client (long-polling, send/delete messages, inline keyboards) |
+| `src/bridge.js` | Message routing — handles auth, maps user IDs to Freebuff sessions |
+| `src/user-store.js` | Token-based user authentication and persistence |
 | `src/freebuff.js` | Freebuff PTY wrapper — spawns process, sends input, extracts response |
 | `src/vt-screen.js` | VT100/XTerm screen buffer emulator for terminal output parsing |
 | `src/config.js` | Configuration loader (JSON file or environment variables) |
@@ -60,7 +74,7 @@ The `main()` function:
 1. Loads configuration from `src/config.js`
 2. Creates a `BaleBot` instance and verifies the token via `getMe()`
 3. Creates a `Bridge` instance to handle message routing
-4. Starts the long-polling loop via `bot.start()`
+4. Starts the long-polling loop via `bot.start()` with message and callback handlers
 5. Registers `SIGINT`/`SIGTERM` handlers for graceful shutdown
 
 ```bash
@@ -90,11 +104,12 @@ new BaleBot(token, { pollTimeout = 30 })
 | Method | Description |
 |--------|-------------|
 | `call(method, params)` | Generic API call. POSTs JSON to the Bale API, checks `ok` field, returns `result`. Timeout: 60s. |
-| `sendMessage(chatId, text, opts?)` | Send a text message. Options: `replyToMessageId`, `parseMode`. |
+| `sendMessage(chatId, text, opts?)` | Send a text message. Options: `replyToMessageId`, `parseMode`, `reply_markup`. |
+| `sendInlineKeyboard(chatId, text, keyboard, opts?)` | Send a message with inline keyboard buttons. `keyboard` is a 2D array of `{ text, callback_data }`. |
 | `sendChatAction(chatId, action?)` | Send a typing indicator (default: `'typing'`). |
 | `deleteMessage(chatId, messageId)` | Delete a message by ID. |
 | `getUpdates()` | Long-poll for new messages. Tracks `offset` to avoid duplicates. |
-| `start(onMessage)` | Start the polling loop. Calls `onMessage(msg)` for each incoming message. Continues on poll timeout. Retries after 3s on other errors. |
+| `start(onMessage, onCallbackQuery?)` | Start the polling loop. Calls `onMessage(msg)` for messages and `onCallbackQuery(query)` for button presses. |
 | `stop()` | Stop the polling loop. |
 | `getMe()` | Fetch bot info (username, first_name, etc.). |
 
@@ -102,7 +117,7 @@ new BaleBot(token, { pollTimeout = 30 })
 
 ### `src/bridge.js` — `Bridge` Class
 
-Routes Bale messages to per-chat Freebuff sessions. Manages the session lifecycle.
+Routes Bale messages to per-user Freebuff sessions. Manages authentication and session lifecycle.
 
 #### Constructor
 
@@ -112,30 +127,54 @@ new Bridge(baleBot)
 
 #### Internal State
 
-- `sessions: Map<chatId, FreebuffSession>` — Active Freebuff sessions per chat
-- `processing: Map<chatId, boolean>` — Prevents concurrent sends to the same session
+- `userStore: UserStore` — Token-based authentication store
+- `sessions: Map<userId, FreebuffSession>` — Active Freebuff sessions per user
+- `processing: Map<userId, boolean>` — Prevents concurrent sends to the same session
 
 #### Methods
 
 | Method | Description |
 |--------|-------------|
-| `isAuthorized(userId)` | Returns `true` if user is in `allowedUsers` (or if list is empty). |
-| `handleMessage(message)` | Main entry point. Checks authorization, routes commands vs text. |
-| `handleCommand(chatId, text)` | Handles `/start`, `/help`, `/new`, `/stop`, `/status` commands. |
-| `sendToFreebuff(chatId, text)` | Core flow: gets/creates a session, sends input, waits for response, sends result back. Blocks if already processing. |
-| `createSession(chatId)` | Creates a new `FreebuffSession`, spawns it, waits for `ready` event (with timeout). |
-| `stopSession(chatId)` | Destroys a session and removes it from the map. |
+| `isAuthenticated(userId)` | Returns `true` if user is authenticated via token. |
+| `handleMessage(message)` | Main entry point. Routes commands vs text, checks authentication. |
+| `handleCommand(chatId, userId, text, from)` | Handles `/start`, `/help`, `/new`, `/stop`, `/status` commands. |
+| `handleStart(chatId, userId, token, from)` | Handles `/start` with optional token authentication. |
+| `handleCallbackQuery(query)` | Handles inline keyboard button presses (status, help). |
+| `sendMainMenu(chatId, text)` | Sends welcome message with inline keyboard buttons. |
+| `sendToFreebuff(chatId, userId, text)` | Core flow: gets/creates session, sends input, waits for response, sends result back. |
+| `createSession(userId)` | Creates a new `FreebuffSession` for the user, spawns it, waits for `ready` event. |
+| `stopSession(userId)` | Destroys a user's session and removes it from the map. |
 | `stopAll()` | Destroys all sessions (used during shutdown). |
 
-#### Message Flow in `sendToFreebuff`
+---
 
-1. Check if already processing for this chat → reject with "please wait" message
-2. Get or create session (spawn + wait for ready)
-3. Set up one-shot `response`/`response_empty` event listeners
-4. Call `session.sendInput(text)` (fire-and-forget, it has its own timer)
-5. Await the response event
-6. Truncate if exceeds `maxOutputLength` (3500 chars by default)
-7. Send the response back via `baleBot.sendMessage()`
+### `src/user-store.js` — `UserStore` Class
+
+Manages token-based user authentication with JSON file persistence.
+
+#### Constructor
+
+```js
+new UserStore(filePath)
+```
+
+- `filePath` — Path to `users.json` file
+
+#### Methods
+
+| Method | Description |
+|--------|-------------|
+| `registerUser(userId, username, firstName)` | Register new user or return existing token. Generates 8-char random token. |
+| `authenticateByToken(token, userId?)` | Validate token and mark user as authenticated. Returns `{userId, success, reason?}`. |
+| `isAuthenticated(userId)` | Check if user is authenticated. |
+| `getToken(userId)` | Get user's token. |
+| `getUser(userId)` | Get full user record. |
+
+#### Token Format
+
+- Random 8-character alphanumeric string (e.g., `a7x9k2m1`)
+- Generated using `crypto.randomBytes`
+- Unique per user, stored in `users.json`
 
 ---
 
@@ -188,27 +227,6 @@ STARTING → IDLE → PROCESSING → IDLE
 | `exit` | `({ exitCode })` | Freebuff process exited or idle timeout |
 | `destroyed` | — | Session destroyed |
 
-#### Response Extraction
-
-The `_grabAndFlush()` method:
-1. Gets the current conversation area (rows 9–31) from VTScreen
-2. Compares with the pre-input snapshot
-3. Filters noise patterns (box-drawing, status bar, thinking indicators)
-4. Identifies new lines (lines in "after" not in "before")
-5. Post-processes: collapses blank lines, removes thinking blocks
-
-#### Noise Patterns
-
-Lines matching these are filtered out:
-
-- Box-drawing/border characters (`╔╗╚╝═║─│╭╮╰╯...`)
-- Freebuff status bar (`X of Y sessions`, `MiMo/DeepSeek...`)
-- Timestamps (`[HH:MM:SS AM]`)
-- Freebuff chrome (`Freebuff will run`, `Directory ~/`, `Ask Freebuff`)
-- Thinking indicators (`Thinking`, `Reading`, `Editing`, `Planning`...)
-- Prompt lines (`❯`, `>`, `▍`, `Enter a coding task`)
-- Empty/whitespace-only lines
-
 ---
 
 ### `src/vt-screen.js` — `VTScreen` Class
@@ -239,36 +257,11 @@ new VTScreen(cols = 120, rows = 40)
 | `process(data)` | Process a chunk of raw terminal output. Handles escape sequences, CR, LF, tab, backspace, and printable chars. |
 | `reset()` | Clear buffer and reset cursor to (0,0). |
 | `getText()` | Get all visible text (line by line, trailing spaces trimmed). |
-| `getText()` | Get all visible text (line by line, trailing spaces trimmed). |
 | `getRow(row)` | Get text content of a specific row. |
 | `getRegion(startRow, endRow)` | Get text from a row range. |
 | `getCleanText()` | Extract text while stripping box-drawing characters at the cell level. |
 | `snapshot()` | Alias for `getText()`, used for diffing. |
 | `hasChar(ch)` | Check if a character exists anywhere on screen. |
-| `VTScreen.snapshotsDifferent(a, b)` | Static method to compare two snapshots. |
-
-#### Escape Sequence Support
-
-The VTScreen processes these escape sequences:
-
-| Sequence | Description |
-|----------|-------------|
-| `ESC [` | CSI (Control Sequence Introducer) |
-| `ESC ]` | OSC (Operating System Command) |
-| CSI `H`/`f` | Cursor Position (CUP) |
-| CSI `A`-`G` | Cursor movement (up/down/forward/back/next-line/prev-line/horizontal-absolute) |
-| CSI `J` | Erase in Display (0=to-end, 1=from-start, 2/3=entire) |
-| CSI `K` | Erase in Line (0=to-end, 1=from-start, 2=entire) |
-| CSI `L`/`M` | Insert/Delete Lines |
-| CSI `S`/`T` | Scroll Up/Down |
-| CSI `X`/`P` | Erase/Delete Characters |
-| CSI `d` | Vertical Position Absolute (VPA) |
-| CSI `m` | SGR (colors/styles — parsed but not tracked) |
-| CSI `h`/`l` | Set/Reset Mode (ignored) |
-| `ESC 7`/`8` | Save/Restore Cursor |
-| `ESC M` | Reverse Index |
-| `ESC D` | Index (line feed) |
-| `ESC c` | Full Reset |
 
 ---
 
@@ -281,7 +274,7 @@ Loads configuration from `config.json` (if exists) with environment variable ove
 | Option | Env Variable | Default | Description |
 |--------|-------------|---------|-------------|
 | `baleToken` | `BALE_BOT_TOKEN` | *required* | Bale Bot API token |
-| `allowedUsers` | `ALLOWED_USERS` | `[]` (all) | Comma-separated user IDs |
+| `usersFile` | `USERS_FILE` | `users.json` | Path to user authentication database |
 | `freebuffPath` | `FREEBUFF_PATH` | `"freebuff"` | Path to Freebuff executable |
 | `sessionTimeoutMs` | `SESSION_TIMEOUT_MS` | `1800000` (30 min) | Session max lifetime |
 | `maxOutputLength` | `MAX_OUTPUT_LENGTH` | `3500` | Max chars per response (Bale limit ~4096) |
@@ -304,7 +297,8 @@ User sends message in Bale
 ┌─ bale.js: getUpdates() receives message
 │
 ├─ bridge.js: handleMessage()
-│   ├─ Check authorization
+│   ├─ Check authentication (userId must be authenticated)
+│   ├─ If not authenticated → Send auth reminder
 │   ├─ If command (starts with /) → handleCommand()
 │   └─ If text → sendToFreebuff()
 │
@@ -321,6 +315,41 @@ User sends message in Bale
 └─ bridge.js: Send response back
     ├─ Truncate if > maxOutputLength
     └─ baleBot.sendMessage(chatId, output)
+```
+
+### Authentication Flow
+
+```
+User sends /start
+        │
+        ▼
+┌─ New user (not in users.json)
+│   → registerUser(userId, username, firstName)
+│   → Send: "🔑 Your token: a7x9k2m1\n\nUse /start a7x9k2m1 to activate"
+│
+├─ Existing user, NOT authenticated
+│   → Send: "🔑 Your token: a7x9k2m1\n\nUse /start a7x9k2m1 to activate"
+│
+└─ Already authenticated
+    → Show main menu with inline keyboard buttons
+```
+
+### Token Validation Flow
+
+```
+User sends /start a7x9k2m1
+        │
+        ▼
+┌─ Token invalid (not found)
+│   → Send: "❌ Token is not valid."
+│
+├─ Token belongs to another user
+│   → Send: "❌ This token belongs to another user."
+│
+└─ Token matches this user
+    → authenticateByToken(token) → authenticated = true
+    → Send: "✅ Authenticated!\n\n🤖 Welcome to Freebuff Bot!"
+    → Show inline keyboard: [📊 Session Status] [📖 Help]
 ```
 
 ### PTY Interaction Detail
@@ -377,17 +406,75 @@ npm start        # Production
 npm run dev      # Development with auto-reload
 ```
 
-### Bot Commands
+### First-Time Setup
+
+1. Start the bot with `npm start`
+2. Send `/start` to the bot in Bale
+3. Copy the token shown in the response
+4. Send `/start <your_token>` to authenticate
+5. You'll see the main menu with inline keyboard buttons
+
+---
+
+## Bot Commands
 
 | Command | Description |
 |---------|-------------|
-| `/start` | Show welcome message and command list |
+| `/start` | Show token (new users) or main menu (authenticated users) |
+| `/start <token>` | Authenticate with your personal token |
 | `/help` | Show help guide |
 | `/new` | Destroy current session and start fresh |
 | `/stop` | Stop current session |
 | `/status` | Show session status (uptime, working dir) |
 
+### Inline Keyboard Buttons
+
+After authentication, you'll see:
+- **📊 وضعیت Session** — Show current session status
+- **📖 راهنما** — Show help guide
+
 Any non-command text message is sent directly as input to Freebuff.
+
+---
+
+## Token Authentication
+
+### How It Works
+
+1. **Registration**: When a user first sends `/start`, they're automatically registered and receive a unique 8-character token
+2. **Authentication**: User must send `/start <token>` to activate their account
+3. **Session Creation**: After authentication, each user gets their own Freebuff PTY session
+4. **Persistence**: User data is stored in `users.json` (gitignored for security)
+
+### Token Security
+
+- Tokens are 8-character random alphanumeric strings
+- Tokens are unique per user
+- Tokens cannot be reused by other users
+- `users.json` is gitignored to prevent accidental credential exposure
+
+### User Data Schema
+
+```json
+{
+  "123456789": {
+    "token": "a7x9k2m1",
+    "username": "ali_dev",
+    "firstName": "Ali",
+    "authenticated": true,
+    "createdAt": "2026-08-19T12:00:00.000Z"
+  }
+}
+```
+
+### Edge Cases
+
+1. **User sends `/start` again after auth** → Shows main menu (idempotent)
+2. **User sends `/start <token>` with already-used token** → "Token already used by another user"
+3. **User sends `/start <wrong_token>`** → "Token is not valid"
+4. **Multiple users try to use same token** → Second user gets "This token belongs to another user"
+5. **users.json corrupted** → UserStore falls back to empty state, new tokens generated
+6. **User not authenticated but sends text** → Blocked with auth reminder
 
 ---
 
@@ -398,7 +485,7 @@ Any non-command text message is sent directly as input to Freebuff.
 1. **Message length** — Bale limits messages to ~4096 characters. Output is truncated at 3500 chars with a "... (بریده شد)" suffix.
 2. **PTY dependency** — Freebuff requires a TTY. `node-pty` is used to simulate one, which requires native compilation.
 3. **Response wait** — A fixed 60-second wait is used before extracting the response. Fast responses may have wasted time; slow responses may be incomplete.
-4. **Single-threaded per user** — Only one input can be processed at a time per chat. Concurrent messages are rejected with a "please wait" message.
+4. **Single-threaded per user** — Only one input can be processed at a time per user. Concurrent messages are rejected with a "please wait" message.
 5. **No persistent sessions** — Sessions are destroyed on idle timeout (30 min) or process restart.
 
 ### Troubleshooting
@@ -409,7 +496,8 @@ Any non-command text message is sent directly as input to Freebuff.
 | Freebuff won't start | Run `freebuff --version` to verify installation; check `freebuffPath` in config |
 | Empty responses | Increase `SESSION_TIMEOUT_MS`, check `responseWaitMs` in `freebuff.js` |
 | PTY native build fails | Ensure build tools are installed (`build-essential` on Linux, Xcode on macOS) |
-| "Access denied" messages | Add your user ID to `allowedUsers` in config |
+| "Access denied" messages | You need to authenticate first — send `/start` to get your token, then `/start <token>` |
+| Token not working | Make sure you're using the exact token shown in `/start` response |
 
 ### Error Handling
 
@@ -428,11 +516,11 @@ Any non-command text message is sent directly as input to Freebuff.
 BALE_BOT_TOKEN=your_bot_token_here
 
 # Optional (with defaults)
-ALLOWED_USERS=                    # Comma-separated user IDs (empty = all)
-FREEBUFF_PATH=freebuff            # Path to freebuff executable
-FREEBUFF_WORKING_DIR=/path/to/dir # Freebuff working directory
-SESSION_TIMEOUT_MS=1800000        # 30 minutes
-MAX_OUTPUT_LENGTH=3500            # Bale message limit
-POLL_TIMEOUT=30                   # Long-poll timeout in seconds
-RESPONSE_WAIT_MS=60000            # 60 seconds
+USERS_FILE=users.json                # User authentication database path
+FREEBUFF_PATH=freebuff               # Path to freebuff executable
+FREEBUFF_WORKING_DIR=/path/to/dir    # Freebuff working directory
+SESSION_TIMEOUT_MS=1800000           # 30 minutes
+MAX_OUTPUT_LENGTH=3500               # Bale message limit
+POLL_TIMEOUT=30                      # Long-poll timeout in seconds
+RESPONSE_WAIT_MS=60000               # 60 seconds
 ```
