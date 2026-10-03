@@ -75,12 +75,17 @@ export class Bridge {
         if (!this.isAuthenticated(userId)) return this.sendAuthReminder(chatId);
         const session = this.sessions.get(String(userId));
         if (session && session.isAlive()) {
-          const uptime = Math.round((Date.now() - session.sessionStartTime) / 60000);
+          const status = session.getStatus();
+          const stateEmoji = status.state === 'idle' ? '🟢' : '🔄';
+          const stateText = status.state === 'idle' ? 'آماده' : 'در حال پردازش';
           await this.baleBot.sendMessage(chatId,
-            `📊 Session فعال (${uptime} دقیقه)\n📂 ${session.cwd}`
+            `${stateEmoji} Session ${stateText}\n` +
+            `⏱️ ${status.uptime} دقیقه فعال\n` +
+            `📂 ${status.cwd}\n` +
+            `🔧 PID: ${status.pid}`
           );
         } else {
-          await this.baleBot.sendMessage(chatId, '📊 Session فعالی نیست.');
+          await this.baleBot.sendMessage(chatId, '📊 Session فعالی نیست.\nبرای شروع /start <توکن> را بزنید.');
         }
         break;
       }
@@ -107,7 +112,29 @@ export class Bridge {
       await this.baleBot.sendMessage(chatId, text);
       return;
     }
-    await this.sendMainMenu(chatId, '✅ احراز هویت با موفقیت انجام شد!\n\n🤖 به Freebuff Bot خوش آمدید!');
+
+    // Start Freebuff session immediately after authentication
+    await this.baleBot.sendMessage(chatId, '✅ احراز هویت با موفقیت انجام شد!\n\n🔄 در حال راه‌اندازی Freebuff...');
+    this._startSessionInBackground(userId, chatId);
+    await this.sendMainMenu(chatId, '🤖 به Freebuff Bot خوش آمدید!');
+  }
+
+  // Start session in background (fire-and-forget)
+  async _startSessionInBackground(userId, chatId) {
+    try {
+      const session = await this.createSession(String(userId));
+      if (session) {
+        console.log(`✅ [BRIDGE] Session ready for user ${userId}`);
+        // Notify user that session is ready
+        await this.baleBot.sendMessage(chatId, '✅ Freebuff آماده است! می‌توانید پیام خود را ارسال کنید.');
+      } else {
+        console.error(`❌ [BRIDGE] Failed to create session for user ${userId}`);
+        await this.baleBot.sendMessage(chatId, '❌ خطا در راه‌اندازی Freebuff. دوباره /new را بزنید.');
+      }
+    } catch (err) {
+      console.error(`❌ [BRIDGE] Background session start error:`, err.message);
+      await this.baleBot.sendMessage(chatId, '❌ خطا در راه‌اندازی Freebuff.');
+    }
   }
 
   async sendMainMenu(chatId, text) {
@@ -166,23 +193,43 @@ export class Bridge {
       // Session is ready — send input and wait for response
       console.log(`📤 [BRIDGE] Sending input to Freebuff`);
 
-      // Note: sendInput internally waits for the response timer
-      // It will emit 'response' or 'response_empty' when done
+      // Progress tracking
+      let lastProgressUpdate = 0;
+      const progressInterval = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - lastProgressUpdate) / 1000);
+        if (elapsed > 10 && session.isAlive()) {
+          // Show thinking indicator every 10s
+          this.baleBot.sendChatAction(chatId, 'typing').catch(() => {});
+        }
+      }, 10000);
+
+      // Note: sendInput internally waits for the response
+      // It will emit 'response', 'response_empty', or 'progress' when done
       const responsePromise = new Promise((resolve) => {
         const onResp = (text) => {
+          clearInterval(progressInterval);
           session.removeListener('response_empty', onEmpty);
+          session.removeListener('progress', onProgress);
           resolve({ type: 'response', text });
         };
         const onEmpty = () => {
+          clearInterval(progressInterval);
           session.removeListener('response', onResp);
+          session.removeListener('progress', onProgress);
           resolve({ type: 'empty' });
+        };
+        const onProgress = (data) => {
+          // Progress is handled by typing indicator above
+          console.log(`📊 [BRIDGE] Progress: ${data.elapsed}s / ${data.maxWait}s`);
         };
         session.on('response', onResp);
         session.on('response_empty', onEmpty);
+        session.on('progress', onProgress);
       });
 
       // Fire-and-forget the input send (it has its own timer)
       session.sendInput(text).catch(err => {
+        clearInterval(progressInterval);
         console.error(`❌ [BRIDGE] sendInput error: ${err.message}`);
       });
 
