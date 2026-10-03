@@ -6,6 +6,9 @@ import { FreebuffSession } from './freebuff.js';
 import config from './config.js';
 import { UserStore } from './user-store.js';
 
+// How often to refresh the typing indicator while waiting on Freebuff
+const TYPING_INTERVAL_MS = 10_000;
+
 export class Bridge {
   constructor(baleBot) {
     this.baleBot = baleBot;
@@ -193,15 +196,13 @@ export class Bridge {
       // Session is ready — send input and wait for response
       console.log(`📤 [BRIDGE] Sending input to Freebuff`);
 
-      // Progress tracking
-      let lastProgressUpdate = 0;
+      // Keep the typing indicator alive while Freebuff works. The session emits
+      // 'progress' every few seconds; this just re-arms the Bale action.
       const progressInterval = setInterval(() => {
-        const elapsed = Math.floor((Date.now() - lastProgressUpdate) / 1000);
-        if (elapsed > 10 && session.isAlive()) {
-          // Show thinking indicator every 10s
+        if (session.isAlive()) {
           this.baleBot.sendChatAction(chatId, 'typing').catch(() => {});
         }
-      }, 10000);
+      }, TYPING_INTERVAL_MS);
 
       // Note: sendInput internally waits for the response
       // It will emit 'response', 'response_empty', or 'progress' when done
