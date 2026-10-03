@@ -6,7 +6,11 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/*.test.js",
+    "fixtures": "node tools/make-fixture.js",
+    "record": "node tools/record-session.js",
+    "replay": "node tools/record-session.js --replay"
   },
   "dependencies": {
     "node-pty": "^1.1.0"
