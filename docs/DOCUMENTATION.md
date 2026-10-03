@@ -61,7 +61,11 @@ Each authenticated user gets exactly one Freebuff PTY process. If the user chats
 | `src/bridge.js` | Message routing — handles auth, maps user IDs to Freebuff sessions |
 | `src/user-store.js` | Token-based user authentication and persistence |
 | `src/freebuff.js` | Freebuff PTY wrapper — spawns process, sends input, extracts response |
-| `src/vt-screen.js` | VT100/XTerm screen buffer emulator for terminal output parsing |
+| `src/vt-screen.js` | VT100/XTerm screen buffer emulator with scrollback, for terminal output parsing |
+| `src/extract.js` | Pure response-extraction logic (noise filtering, sentinel matching, diff fallback) |
+| `src/replay.js` | Replays a recorded fixture through the real extraction pipeline |
+| `tools/record-session.js` | Records a live Freebuff PTY session to a fixture file |
+| `tools/make-fixture.js` | Generates synthetic fixtures so tests run without Freebuff |
 | `src/config.js` | Configuration loader (JSON file or environment variables) |
 
 ---
@@ -229,6 +233,39 @@ STARTING → IDLE → PROCESSING → IDLE
 
 ---
 
+### Response extraction — `src/extract.js`
+
+Pure functions, no PTY and no I/O, so the whole extraction pipeline can be tested offline against recorded fixtures.
+
+| Function | Description |
+|----------|-------------|
+| `filterNoise(lines)` | Drop blank lines and TUI chrome (logo, status bar, input box, prompts) |
+| `findSentinel(lines, sentinel)` | Index of the line echoing the prompt, or -1. Last match wins. |
+| `normalizeForSentinel(line)` | Strip the decorative frame around an echoed prompt (`❯`, `▌`, `│…│`) |
+| `postProcess(lines)` | Drop thinking headers and the indented reasoning under them; collapse blanks |
+| `extractResponse({before, after, sentinel})` | Main entry point — returns `{text, strategy, index}` |
+| `digest(text)` | FNV-1a hash of a transcript, used to detect that output has stopped changing |
+
+#### Two extraction strategies
+
+1. **`sentinel`** — the TUI echoes the prompt into the transcript, so everything after that echo is the reply. Robust even when the conversation scrolled and older lines repeat, because the cut point is a specific line rather than a length delta.
+2. **`diff`** — when the prompt is not echoed (or has scrolled out of the scrollback window), the lines appended after the longest common prefix of the before/after transcripts are returned.
+
+#### Completion detection
+
+Silence is not completion. The model pauses for several seconds before its first token and again between tool calls, so a stability-only check cuts multi-step replies short. The session uses two signals:
+
+1. **Duration footer** — Freebuff stamps a finished reply with `⎘ • 13s • △▽`. Seeing one *after* the sentinel ends the request immediately.
+2. **Transcript digest** — otherwise, an FNV-1a hash of the transcript is polled every second; when it stops changing for `STABLE_MS`, the reply is done. This also catches in-place edits, which a transcript-length check misses. It only applies once actual reply text has been extracted, so a slow first token is never mistaken for an empty reply.
+
+#### Layout detection
+
+The conversation does not start at a fixed row and the status bar moves with the terminal size and Freebuff version. `conversationText()` finds the status bar by its own content (`✕ End session`, `45m left`, `11.9K (9%)`) and cuts the transcript just above it. This matters twice: chrome never reaches the reply, and the status bar's per-minute countdown never makes the digest look unstable.
+
+#### Writing to the TUI
+
+`sendInput` writes the prompt and the Enter key as **separate** writes, ~50 ms apart. Freebuff's input handler drops input when both arrive in the same tick, and the message is silently never submitted.
+
 ### `src/vt-screen.js` — `VTScreen` Class
 
 A VT100/XTerm screen buffer emulator. Tracks virtual terminal content by processing raw escape sequences from the PTY.
@@ -238,6 +275,25 @@ A VT100/XTerm screen buffer emulator. Tracks virtual terminal content by process
 ```js
 new VTScreen(cols = 120, rows = 40)
 ```
+
+#### Scrollback and scrolling regions
+
+The emulator keeps every line that scrolls off the top of the screen, bounded by `scrollbackLimit` (default 2000 lines). Without it, a reply longer than the visible conversation pane would be silently truncated to whatever happened to fit on screen.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `scrollback` | `Cell[][]` | Lines that have scrolled off the screen, oldest first |
+| `scrollbackLimit` | `number` | Maximum retained scrollback lines |
+| `scrollTop` / `scrollBottom` | `number` | Active scrolling region (DECSTBM / `CSI r`), inclusive |
+
+| Method | Description |
+|--------|-------------|
+| `getScrollbackLength()` | Number of lines retained in scrollback |
+| `getScrollbackText()` | Scrollback lines as text |
+| `getTranscriptText(endRow?)` | Scrollback + visible rows above `endRow` — the full linear conversation |
+| `getStreamIndex()` | Absolute line index of the cursor (scrollback + row), stable across scrolling |
+
+A real TUI scrolls only its conversation pane and pins the logo and status bar, which is what `CSI r` support handles. Content scrolling out of that region still lands in scrollback, so long replies are never lost.
 
 #### Properties
 
@@ -348,8 +404,10 @@ User sends /start a7x9k2m1
 │
 └─ Token matches this user
     → authenticateByToken(token) → authenticated = true
-    → Send: "✅ Authenticated!\n\n🤖 Welcome to Freebuff Bot!"
+    → Send: "✅ Authenticated!"
+    → Start Freebuff session in background (fire-and-forget)
     → Show inline keyboard: [📊 Session Status] [📖 Help]
+    → When session ready: "✅ Freebuff آماده است!"
 ```
 
 ### PTY Interaction Detail
@@ -412,7 +470,9 @@ npm run dev      # Development with auto-reload
 2. Send `/start` to the bot in Bale
 3. Copy the token shown in the response
 4. Send `/start <your_token>` to authenticate
-5. You'll see the main menu with inline keyboard buttons
+5. Freebuff session starts automatically in background
+6. You'll see "✅ Freebuff آماده است!" when session is ready
+7. Send any message to start using Freebuff
 
 ---
 
@@ -475,6 +535,7 @@ Any non-command text message is sent directly as input to Freebuff.
 4. **Multiple users try to use same token** → Second user gets "This token belongs to another user"
 5. **users.json corrupted** → UserStore falls back to empty state, new tokens generated
 6. **User not authenticated but sends text** → Blocked with auth reminder
+7. **Session starts on authentication** → Freebuff session begins immediately when user authenticates, ready before first message
 
 ---
 
@@ -484,9 +545,10 @@ Any non-command text message is sent directly as input to Freebuff.
 
 1. **Message length** — Bale limits messages to ~4096 characters. Output is truncated at 3500 chars with a "... (بریده شد)" suffix.
 2. **PTY dependency** — Freebuff requires a TTY. `node-pty` is used to simulate one, which requires native compilation.
-3. **Response wait** — A fixed 60-second wait is used before extracting the response. Fast responses may have wasted time; slow responses may be incomplete.
+3. **Dynamic response detection** — Watches a hash of the transcript: minimum 10s wait, then 6s of unchanged output before a reply is accepted. A reply that streams faster than the screen scrolls is still captured, because scrollback is included.
 4. **Single-threaded per user** — Only one input can be processed at a time per user. Concurrent messages are rejected with a "please wait" message.
 5. **No persistent sessions** — Sessions are destroyed on idle timeout (30 min) or process restart.
+6. **Logo filtering** — Freebuff's ASCII logo is filtered out from responses using pattern matching.
 
 ### Troubleshooting
 
@@ -498,6 +560,30 @@ Any non-command text message is sent directly as input to Freebuff.
 | PTY native build fails | Ensure build tools are installed (`build-essential` on Linux, Xcode on macOS) |
 | "Access denied" messages | You need to authenticate first — send `/start` to get your token, then `/start <token>` |
 | Token not working | Make sure you're using the exact token shown in `/start` response |
+
+### Testing
+
+Extraction is the fragile part of this project, so it is separated from the PTY layer and tested offline with the built-in Node test runner.
+
+```bash
+npm test              # run the suite (no Freebuff, no network, no API keys needed)
+npm run fixtures      # regenerate the synthetic fixtures
+npm run record -- --input "your prompt" --name my-session --text
+npm run replay -- fixtures/my-session.json
+```
+
+| Path | Purpose |
+|------|---------|
+| `test/vt-screen.test.js` | Scrollback, scrolling regions, cursor addressing, malformed escapes |
+| `test/extract.test.js` | Noise filtering, sentinel matching, diff fallback, digest |
+| `test/pipeline.test.js` | Replays recorded fixtures end-to-end and asserts nothing is lost or leaked |
+| `fixtures/real-*.json` | Captures of actual Freebuff 0.0.153 sessions — the ground truth |
+| `tools/record-session.js` | Records a live PTY session: every raw chunk with its timestamp |
+| `tools/make-fixture.js` | Builds deterministic fixtures so CI needs no Freebuff install |
+
+A recorded fixture stores the raw PTY chunks plus a marker recording the moment the prompt was submitted, so `src/replay.js` can rebuild the exact transcript and cut the reply at the same point production would — no timing or heuristics involved. Set `FREEBUFF_DEBUG=1` to get the raw transcript and extracted reply logged on every request.
+
+The synthetic fixtures mirror the real layout recorded from Freebuff 0.0.153 (block-character splash, bordered stats box, status bar, input box, model bar) so CI needs no Freebuff install. The real fixtures are what caught every layout bug listed above — re-record them whenever Freebuff is upgraded.
 
 ### Error Handling
 

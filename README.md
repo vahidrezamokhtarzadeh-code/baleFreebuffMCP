@@ -94,6 +94,35 @@ npm run dev
 - **KHTML**: Freebuff CLI به TTY نیاز دارد. از `node-pty` برای شبیه‌سازی TTY استفاده می‌شود.
 - **تبلیغات**: Freebuff ممکن است اعلان‌های تبلیغاتی در خروجی نشان دهد.
 
+## 🧪 تست و دیباگ
+
+استخراج پاسخ از TUI شکننده‌ترین بخش این پروژه است، چون به نحوه‌ی رندر Freebuff وابسته است. به همین دلیل مسیر استخراج از لایه‌ی PTY جدا شده و کاملاً آفلاین قابل تست است.
+
+```bash
+npm test              # اجرای تست‌ها
+npm run fixtures      # ساخت fixture‌های مصنوعی (بدون نیاز به Freebuff)
+```
+
+### ضبط یک نشست واقعی
+
+برای دیباگ کردن مشکلات استخراج، یک نشست واقعی ضبط کنید:
+
+```bash
+npm run record -- --input "پیام تستی" --name my-session --text
+```
+
+خروجی در `fixtures/my-session.json` ذخیره می‌شود (خروجی خام PTY با زمان‌بندی تکه‌ها).
+
+### پخش مجدد یک نشست
+
+بدون اجرای Freebuff، خروجی یک نشست ضبط‌شده را ببینید:
+
+```bash
+npm run replay -- fixtures/my-session.json
+```
+
+این دستور transcript را بازسازی می‌کند و نشان می‌دهد چه چیزی به‌عنوان پاسخ استخراج شده است.
+
 ## 🏗️ ساختار پروژه
 
 ```
@@ -101,9 +130,18 @@ bale-freebuff-bot/
 ├── src/
 │   ├── index.js      # نقطه ورود اصلی
 │   ├── bale.js       # کلاینت Bale Bot API
-│   ├── freebuff.js   # رپر PTY Freebuff
 │   ├── bridge.js     # پل ارتباطی Bale ↔ Freebuff
+│   ├── freebuff.js   # رپر PTY Freebuff (تشخیص پایان پاسخ)
+│   ├── vt-screen.js  # شبیه‌ساز ترمینال + scrollback
+│   ├── extract.js    # استخراج پاسخ از transcript (تابع خالص)
+│   ├── replay.js     # پخش مجدد fixture‌های ضبط‌شده
+│   ├── user-store.js # احراز هویت توکنی
 │   └── config.js     # مدیریت پیکربندی
+├── tools/
+│   ├── record-session.js  # ضبط یک نشست واقعی Freebuff
+│   └── make-fixture.js    # ساخت fixture مصنوعی برای CI
+├── test/             # تست‌های آفلاین (node:test)
+├── fixtures/         # نشست‌های ضبط‌شده
 ├── config.example.json
 ├── .env.example
 ├── package.json
